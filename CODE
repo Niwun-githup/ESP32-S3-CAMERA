@@ -1,0 +1,255 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <PubSubClient.h>
+
+// Select camera model
+#define CAMERA_MODEL_ESP32S3_EYE // Has PSRAM
+
+#include "camerawroom_pins.h" // ไฟล์กำหนดพินสำหรับ ESP32S3WROOM
+
+const char* ssid = "..........";   // ใส่ชื่อ Wi-Fi ของคุณ
+const char* password = "............."; // ใส่รหัสผ่าน Wi-Fi ของคุณ
+
+// MQTT Config
+const char* mqtt_server = "192.168.1.00";
+const int mqtt_port = 1883;
+const char* mqtt_user = "PPPPPPPP";
+const char* mqtt_password = "123456789";
+const char* mqtt_topic = "esp32s3wroom/image"; // Topic สำหรับ ESP32S3WROOM
+const char* mqtt_client_id = "ESP32S3WROOMClient"; // Client ID สำหรับ ESP32S3WROOM
+
+WebServer server(80); // สร้างเว็บเซิร์ฟเวอร์ที่พอร์ต 80
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+unsigned long lastCaptureTime = 0; // เก็บเวลาล่าสุดที่ capture ภาพ
+const unsigned long captureInterval = 10000; // 10 วินาที (หน่วย: มิลลิวินาที)
+
+void cameraInit(void);
+void startCameraServer();
+void reconnectMQTT();
+void sendImageOverMQTT();
+void callback(char* topic, byte* payload, unsigned int length);
+
+// ฟังก์ชันสำหรับ Task ส่งภาพผ่าน MQTT
+void sendImageTask(void *parameter) {
+  while (1) {
+    if (millis() - lastCaptureTime >= captureInterval) {
+      sendImageOverMQTT(); // Capture และส่งภาพ
+      lastCaptureTime = millis(); // อัปเดตเวลาล่าสุด
+    }
+    delay(100); // เพิ่ม delay เพื่อลดภาระการประมวลผล
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
+
+  // แสดงข้อความ log เบื้องต้น
+  Serial.println("Build:Mar 27 2021");
+  Serial.println("rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)");
+  Serial.println("SPIWP:0xee");
+  Serial.println("mode:DIO, clock div:1");
+  Serial.println("load:0x3fce2820,len:0x1188");
+  Serial.println("load:0x403c8700,len:0x4");
+  Serial.println("load:0x403c8704,len:0xbf0");
+  Serial.println("load:0x403cb700,len:0x30e4");
+  Serial.println("entry 0x403c88ac");
+
+  cameraInit(); // เริ่มต้นกล้อง
+
+  WiFi.begin(ssid, password); // เชื่อมต่อ Wi-Fi
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+
+  startCameraServer(); // เริ่มต้นเว็บเซิร์ฟเวอร์
+
+  Serial.print("Camera Ready! Use 'http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("' to connect");
+
+  // ตั้งค่า MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback); // ตั้งค่า callback function
+
+  // สร้าง Task สำหรับส่งภาพ
+  xTaskCreate(
+    sendImageTask,   // ฟังก์ชันที่ Task จะรัน
+    "SendImageTask", // ชื่อ Task
+    10000,          // ขนาด Stack
+    NULL,           // พารามิเตอร์
+    1,              // ความสำคัญ
+    NULL            // Task handle
+  );
+}
+
+void loop() {
+  server.handleClient(); // จัดการ request จากไคลเอนต์
+
+  if (!client.connected()) {
+    Serial.println("MQTT disconnected. Reconnecting...");
+    reconnectMQTT(); // เชื่อมต่อ MQTT ใหม่หากขาดการเชื่อมต่อ
+  }
+  client.loop(); // ให้ MQTT client ทำงาน
+}
+
+void cameraInit(void) {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG; // ใช้รูปแบบ JPEG สำหรับสตรีมมิ่ง
+
+  // ตั้งค่าความละเอียดภาพและคุณภาพ JPEG ตาม PSRAM
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_SVGA; // ใช้ความละเอียด SVGA (800x600) หากมี PSRAM
+    config.jpeg_quality = 12;          // ตั้งค่าคุณภาพ JPEG (ค่าสูง = คุณภาพต่ำ)
+    config.fb_count = 2;               // จำนวน frame buffer
+  } else {
+    config.frame_size = FRAMESIZE_VGA; // ใช้ความละเอียด VGA (640x480) หากไม่มี PSRAM
+    config.jpeg_quality = 15;          // ตั้งค่าคุณภาพ JPEG
+    config.fb_count = 1;               // จำนวน frame buffer
+  }
+
+  // เริ่มต้นกล้อง
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+
+  // ตั้งค่าเซ็นเซอร์กล้อง
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_vflip(s, 0); // กลับภาพแนวตั้ง (vertical flip)
+  s->set_hmirror(s, 1); // กลับภาพแนวนอน (horizontal mirror)
+  s->set_brightness(s, 0); // ปรับความสว่าง
+  s->set_saturation(s, 0); // ปรับความอิ่มตัวของสี
+}
+
+void startCameraServer() {
+  // จัดการ request ที่ path "/"
+  server.on("/", HTTP_GET, []() {
+    String html = "<html><head><title>ESP32-CAM</title></head><body>";
+    html += "<h1>ESP32-CAM Video Stream</h1>";
+    html += "<img src=\"/stream\" style=\"width: 100%; height: auto;\">";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  // จัดการ request ที่ path "/stream" เพื่อสตรีมวิดีโอแบบ MJPEG
+  server.on("/stream", HTTP_GET, []() {
+    WiFiClient client = server.client();
+    String response = "HTTP/1.1 200 OK\r\n";
+    response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+    server.sendContent(response);
+
+    while (true) {
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (!fb) {
+        Serial.println("Camera capture failed");
+        break;
+      }
+
+      response = "--frame\r\n";
+      response += "Content-Type: image/jpeg\r\n\r\n";
+      server.sendContent(response);
+
+      client.write((const char *)fb->buf, fb->len);
+      server.sendContent("\r\n");
+
+      esp_camera_fb_return(fb);
+
+      // ปรับความเร็วสตรีม (หน่วย: มิลลิวินาที)
+      delay(100); // ตัวอย่าง: 10 เฟรมต่อวินาที (100 ms ต่อเฟรม)
+    }
+  });
+
+  // เริ่มต้นเว็บเซิร์ฟเวอร์
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void reconnectMQTT() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect(mqtt_client_id, mqtt_user, mqtt_password)) {
+      Serial.println("connected");
+      // Once connected, publish an announcement...
+      client.publish(mqtt_topic, "ESP32CAM connected");
+      // ... and resubscribe
+      client.subscribe(mqtt_topic);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+void sendImageOverMQTT() {
+  // Capture ภาพจากกล้อง
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return;
+  }
+
+  // แสดงขนาดภาพที่ capture
+  Serial.printf("Captured image size: %d bytes\n", fb->len);
+
+  // ตรวจสอบว่าภาพมีขนาดมากกว่า 0
+  if (fb->len > 0) {
+    // ส่งภาพผ่าน MQTT
+    if (client.publish_P(mqtt_topic, fb->buf, fb->len, false)) {
+      Serial.println("Image sent to MQTT as JSON!");
+    } else {
+      Serial.println("Failed to send image via MQTT");
+    }
+  } else {
+    Serial.println("Invalid image size, skipping MQTT publish");
+  }
+
+  // คืน memory ให้ระบบ
+  esp_camera_fb_return(fb);
+}
+
+// ฟังก์ชัน callback สำหรับรับข้อมูลจาก MQTT
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+
+  // แสดง payload ที่ได้รับ
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+}
